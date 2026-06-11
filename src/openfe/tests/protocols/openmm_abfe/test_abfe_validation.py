@@ -254,7 +254,7 @@ def test_charged_endstate(charged_benzene_modifications, T4_protein_component):
         }
     )
 
-    errmsg = "Charged alchemical molecules are not currently supported"
+    errmsg = "explicit_charge_correction"
     with pytest.raises(ValueError, match=errmsg):
         AbsoluteBindingProtocol._validate_endstates(stateA, stateB)
 

@@ -14,6 +14,9 @@ alchemical sampling methods:
 Current limitations
 -------------------
 * Alchemical species with a net charge are not currently supported.
+  (Charged ligands are supported only in ``AbsoluteBindingProtocol``
+  with explicit charge correction; the vacuum leg of solvation
+  free energies requires different treatment.)
 * Disappearing molecules are only allowed in state A. Support for
   appearing molecules will be added in due course.
 * Only small molecules are allowed to act as alchemical molecules.

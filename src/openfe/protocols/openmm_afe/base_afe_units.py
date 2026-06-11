@@ -67,6 +67,7 @@ from openfe.protocols.openmm_afe.equil_afe_settings import (
 )
 from openfe.protocols.openmm_md.plain_md_methods import PlainMDSimulationUnit
 from openfe.protocols.openmm_utils import (
+    charge_correction,
     charge_generation,
     multistate_analysis,
     omm_compute,
@@ -90,6 +91,22 @@ from openfe.protocols.restraint_utils.openmm import omm_restraints
 from openfe.utils import log_system_probe, without_oechem_backend
 
 logger = logging.getLogger(__name__)
+
+
+class ChargeCorrectionParameterState(GlobalParameterState):
+    """Composable state controlling the water-to-ion charge correction.
+
+    Couples to the ``lambda_charge_correction`` global parameter in the
+    ``NonbondedForce``.  At value 0 the correction species behaves as
+    water; at value 1 it behaves as the selected counterion.
+
+    This follows the OpenFE user-facing convention (0 = fully interacting
+    ligand / state A, 1 = annihilated ligand / state B) and is **not**
+    inverted like the OpenMMTools ``lambda_electrostatics`` parameter.
+    """
+    lambda_charge_correction = GlobalParameterState.GlobalParameter(
+        "lambda_charge_correction", standard_value=0.0,
+    )
 
 
 class AbsoluteUnitMixin:
@@ -619,6 +636,85 @@ class BaseAbsoluteSetupUnit(gufe.ProtocolUnit, AbsoluteUnitMixin):
         return alchemical_factory, alchemical_system, alchemical_indices
 
     @staticmethod
+    def _apply_charge_correction(
+        alchem_system: openmm.System,
+        topology: app.Topology,
+        positions: ommunit.Quantity,
+        alchem_comps: dict[str, list[Component]],
+        solvent_component: SolventComponent | None,
+        alchemical_settings: AlchemicalSettings,
+    ) -> dict | None:
+        """
+        Apply explicit charge correction to the alchemical system if the
+        disappearing ligand is charged and the setting is enabled.
+
+        Selects a bulk water far from solutes and adds NonbondedForce
+        particle parameter offsets to smoothly transform it into a
+        counterion controlled by ``lambda_charge_correction``.
+
+        Parameters
+        ----------
+        alchem_system : openmm.System
+            The alchemical system (modified in place).
+        topology : openmm.app.Topology
+            System topology.
+        positions : openmm.unit.Quantity
+            Current (post-equilibration) positions.
+        alchem_comps : dict[str, list[Component]]
+            Alchemical components (``stateA`` key).
+        solvent_component : SolventComponent or None
+            Solvent component providing ion names.
+        alchemical_settings : AlchemicalSettings
+            Settings including charge correction flags.
+
+        Returns
+        -------
+        metadata : dict or None
+            Correction metadata if applied, ``None`` otherwise.
+        """
+        if not alchemical_settings.explicit_charge_correction:
+            return None
+
+        ligand = alchem_comps["stateA"][0]
+        ligand_charge = ligand.total_charge
+        if ligand_charge == 0:
+            return None
+
+        if solvent_component is None:
+            raise ValueError(
+                "Explicit charge correction requires solvent but "
+                "no SolventComponent is present."
+            )
+
+        pos_array = positions.value_in_unit(ommunit.nanometer)
+
+        water_resids = charge_correction.get_alchemical_waters(
+            topology=topology,
+            positions=pos_array,
+            charge_difference=ligand_charge,
+            distance_cutoff=alchemical_settings.explicit_charge_correction_cutoff,
+        )
+
+        metadata = charge_correction.apply_afe_charge_correction_offsets(
+            system=alchem_system,
+            topology=topology,
+            water_resids=water_resids,
+            ligand_charge=ligand_charge,
+            solvent_component=solvent_component,
+        )
+
+        metadata["ligand_formal_charge"] = ligand_charge
+        metadata["ligand_name"] = ligand.name
+
+        logger.info(
+            f"Charge correction applied: ligand '{ligand.name}' "
+            f"(charge={ligand_charge}), correction water residue(s) "
+            f"{water_resids} → {metadata['ion_resname']} ion"
+        )
+
+        return metadata
+
+    @staticmethod
     def _subsample_topology(
         topology: openmm.app.Topology,
         positions: openmm.unit.Quantity,
@@ -739,6 +835,16 @@ class BaseAbsoluteSetupUnit(gufe.ProtocolUnit, AbsoluteUnitMixin):
             alchemical_settings=settings["alchemical_settings"],
         )
 
+        # Apply explicit charge correction if needed
+        charge_correction_metadata = self._apply_charge_correction(
+            alchem_system=alchem_system,
+            topology=omm_topology,
+            positions=positions,
+            alchem_comps=alchem_comps,
+            solvent_component=solv_comp,
+            alchemical_settings=settings["alchemical_settings"],
+        )
+
         # Subselect system based on user inputs & write initial PDB
         selection_indices = self._subsample_topology(
             topology=omm_topology,
@@ -780,6 +886,8 @@ class BaseAbsoluteSetupUnit(gufe.ProtocolUnit, AbsoluteUnitMixin):
             unit_results_dict["restraint_geometry"] = restraint_geometry.model_dump()
         else:
             unit_results_dict["restraint_geometry"] = None
+
+        unit_results_dict["charge_correction"] = charge_correction_metadata
 
         if dry:
             unit_results_dict |= {
@@ -857,6 +965,17 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
         else:
             return False
 
+    @staticmethod
+    def _system_has_charge_correction(system: openmm.System) -> bool:
+        """Check if the system has a ``lambda_charge_correction`` parameter."""
+        from openmm import NonbondedForce
+        for force in system.getForces():
+            if isinstance(force, NonbondedForce):
+                for i in range(force.getNumGlobalParameters()):
+                    if force.getGlobalParameterName(i) == "lambda_charge_correction":
+                        return True
+        return False
+
     @abc.abstractmethod
     def _get_components(
         self,
@@ -876,7 +995,9 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
         ...
 
     def _get_lambda_schedule(
-        self, settings: dict[str, SettingsBaseModel]
+        self,
+        settings: dict[str, SettingsBaseModel],
+        has_charge_correction: bool = False,
     ) -> dict[str, list[float]]:
         """
         Create the lambda schedule
@@ -885,6 +1006,10 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
         ----------
         settings : dict[str, SettingsBaseModel]
           Settings for the unit.
+        has_charge_correction : bool
+          Whether to include ``lambda_charge_correction`` in the
+          schedule.  When True, it follows the user-facing
+          ``lambda_elec`` (not inverted).
 
         Returns
         -------
@@ -907,6 +1032,11 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
         lambdas["lambda_electrostatics"] = [1 - x for x in lambda_elec]
         lambdas["lambda_sterics"] = [1 - x for x in lambda_vdw]
         lambdas["lambda_restraints"] = [x for x in lambda_rest]
+
+        # Charge correction follows user-facing lambda_elec (NOT inverted):
+        # lambda_elec=0 → water (ligand interacting), lambda_elec=1 → ion
+        if has_charge_correction:
+            lambdas["lambda_charge_correction"] = list(lambda_elec)
 
         return lambdas
 
@@ -974,6 +1104,13 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
             # In this case we also don't have a restraint being controlled
             # so we drop it from the protocol
             param_protocol.pop("lambda_restraints", None)
+
+        # Add charge correction composable state if the schedule includes it
+        if "lambda_charge_correction" in param_protocol:
+            correction_state = ChargeCorrectionParameterState(
+                lambda_charge_correction=0.0,
+            )
+            composable_states.append(correction_state)
 
         cmp_states = create_thermodynamic_state_protocol(
             alchemical_system,
@@ -1413,8 +1550,11 @@ class BaseAbsoluteMultiStateSimulationUnit(gufe.ProtocolUnit, AbsoluteUnitMixin)
         # Get the components
         alchem_comps, solv_comp, prot_comp, small_mols = self._get_components()
 
+        # Detect charge correction from global parameter on the system
+        has_charge_correction = self._system_has_charge_correction(system)
+
         # Get the lambda schedule
-        lambdas = self._get_lambda_schedule(settings)
+        lambdas = self._get_lambda_schedule(settings, has_charge_correction)
 
         # Get the compute platform
         restrict_cpu = settings["forcefield_settings"].nonbonded_method.lower() == "nocutoff"
