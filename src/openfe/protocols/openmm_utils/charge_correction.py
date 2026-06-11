@@ -5,11 +5,12 @@
 
 These helpers select water molecules suitable for alchemical transformation
 into counterions and retrieve the necessary force field parameters. They are
-protocol-independent and can be used by both the hybrid topology RFE protocol
-and the separated topologies (SepTop) protocol.
+protocol-independent and can be used by the hybrid topology RFE protocol,
+the separated topologies (SepTop) protocol, and the absolute free energy
+(AFE) protocols.
 
-Sign convention
----------------
+Sign convention for RFE / SepTop (hybrid topology)
+---------------------------------------------------
 ``charge_difference`` is defined as ``formal_charge(stateA) - formal_charge(stateB)``.
 
 * charge_difference > 0: stateB is more negative → couple a **negative** ion
@@ -19,6 +20,17 @@ Sign convention
 
 The mapping to ion type is:
     {+1: negative_ion, -1: positive_ion}[charge_difference]
+
+Sign convention for AFE (absolute binding)
+------------------------------------------
+For a disappearing ligand with formal charge ``q``, the correction ion must
+carry charge ``q`` to replace the charge being annihilated:
+
+* q > 0 → grow a **positive** ion (e.g. Na+)
+* q < 0 → grow a **negative** ion (e.g. Cl-)
+
+This keeps the total system charge constant: as the ligand electrostatics
+are turned off, the correction species gains the same charge.
 """
 
 import logging
@@ -293,3 +305,132 @@ def transform_waters_to_ions_inplace(
                             "Modifying an atom that doesn't match known water parameters"
                         )
                     nbf.setParticleParameters(idx, 0.0, sigma, epsilon)
+
+
+def apply_afe_charge_correction_offsets(
+    system: System,
+    topology: app.Topology,
+    water_resids: list[int],
+    ligand_charge: int,
+    solvent_component,
+    parameter_name: str = "lambda_charge_correction",
+) -> dict:
+    """
+    Add ``NonbondedForce`` particle parameter offsets that smoothly
+    transform selected water molecule(s) into counterion(s), controlled
+    by a global ``lambda`` parameter.
+
+    This is designed for absolute free energy (AFE) protocols where a
+    charged ligand is annihilated.  The correction ion carries the **same
+    sign** as the disappearing ligand charge so that the total system
+    charge remains constant across the lambda schedule.
+
+    At ``parameter_name = 0`` the correction atoms behave as normal water
+    (state A, ligand fully interacting).
+    At ``parameter_name = 1`` the oxygen has ion parameters and hydrogen
+    charges are zero (state B, ligand electrostatics annihilated).
+
+    Parameters
+    ----------
+    system : openmm.System
+        The (alchemical) system to modify **in place**.
+    topology : openmm.app.Topology
+        Topology matching the system.
+    water_resids : list[int]
+        Residue indices of waters to transform (from
+        :func:`get_alchemical_waters`).
+    ligand_charge : int
+        The formal charge of the disappearing ligand.  ``+1`` grows a
+        cation; ``-1`` grows an anion.
+    solvent_component
+        ``SolventComponent`` providing ``positive_ion`` /
+        ``negative_ion`` residue names.
+    parameter_name : str
+        Name of the global parameter added to the ``NonbondedForce``.
+
+    Returns
+    -------
+    metadata : dict
+        ``ion_resname``, ``correction_atom_indices``, and
+        ``water_residue_indices`` for downstream bookkeeping.
+
+    Raises
+    ------
+    ValueError
+        If ``ligand_charge`` is zero (no correction needed), if the
+        number of waters does not match ``abs(ligand_charge)``, if
+        there is not exactly one ``NonbondedForce``, or if a water
+        atom has unexpected parameters.
+    """
+    if ligand_charge == 0:
+        raise ValueError(
+            "No charge correction needed for a neutral ligand"
+        )
+
+    if abs(ligand_charge) != len(water_resids):
+        raise ValueError(
+            f"Expected {abs(ligand_charge)} alchemical water residue(s), "
+            f"got {len(water_resids)}"
+        )
+
+    if ligand_charge > 0:
+        ion_resname = solvent_component.positive_ion.strip("-+").upper()
+    else:
+        ion_resname = solvent_component.negative_ion.strip("-+").upper()
+
+    ion_charge, ion_sigma, ion_epsilon, o_charge, h_charge = (
+        get_ion_and_water_parameters(topology, system, ion_resname, "HOH")
+    )
+
+    nbfrcs = [f for f in system.getForces() if isinstance(f, NonbondedForce)]
+    if len(nbfrcs) != 1:
+        raise ValueError(
+            f"Expected exactly 1 NonbondedForce, found {len(nbfrcs)}"
+        )
+    nbf = nbfrcs[0]
+
+    nbf.addGlobalParameter(parameter_name, 0.0)
+
+    correction_atom_indices = []
+    for res in topology.residues():
+        if res.index in water_resids:
+            atoms = list(res.atoms())
+            if len(atoms) > 3:
+                raise ValueError(
+                    "Non 3-site waters (i.e. waters with virtual sites) "
+                    "are not currently supported as alchemical waters"
+                )
+            for at in atoms:
+                idx = at.index
+                correction_atom_indices.append(idx)
+                charge, sigma, epsilon = nbf.getParticleParameters(idx)
+                if charge == o_charge:
+                    nbf.addParticleParameterOffset(
+                        parameter_name,
+                        idx,
+                        ion_charge - charge,
+                        ion_sigma - sigma,
+                        ion_epsilon - epsilon,
+                    )
+                elif charge == h_charge:
+                    zero_charge = 0.0 * charge.unit
+                    zero_len = 0.0 * sigma.unit
+                    zero_energy = 0.0 * epsilon.unit
+                    nbf.addParticleParameterOffset(
+                        parameter_name,
+                        idx,
+                        zero_charge - charge,
+                        zero_len,
+                        zero_energy,
+                    )
+                else:
+                    raise ValueError(
+                        "Modifying an atom that doesn't match known "
+                        "water parameters"
+                    )
+
+    return {
+        "ion_resname": ion_resname,
+        "correction_atom_indices": correction_atom_indices,
+        "water_residue_indices": water_resids,
+    }

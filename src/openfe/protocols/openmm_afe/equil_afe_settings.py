@@ -89,21 +89,29 @@ class AlchemicalSettings(SettingsBaseModel):
     """
     explicit_charge_correction: bool = False
     """
-    Whether to explicitly account for a net charge difference during
-    the alchemical transformation by transforming a bulk water molecule
-    into a counterion. The ion is coupled/decoupled alongside the
-    ligand whose appearance would otherwise change the system's total
-    charge.
+    Whether to explicitly account for the net charge change during
+    an alchemical annihilation by smoothly transforming a bulk water
+    molecule into a counterion.
 
-    Only absolute charge differences of 1 are currently supported.
-    Requires solvent (explicit water) and PME electrostatics.
+    For ``AbsoluteBindingProtocol``, a disappearing ligand with formal
+    charge *q* will have a water transformed into an ion of the **same**
+    sign as *q*, keeping the total system charge constant across the
+    lambda schedule.  The ion is grown via ``NonbondedForce`` particle
+    parameter offsets controlled by ``lambda_charge_correction``, which
+    follows the user-facing ``lambda_elec`` schedule (0 = water, 1 = ion).
+
+    .. note::
+       This feature is currently **experimental**.  Only formal charges
+       of +1 or -1 are supported.  Requires solvated PME systems with
+       3-site water models (e.g. TIP3P).
 
     Default False.
     """
     explicit_charge_correction_cutoff: NanometerQuantity = 0.8 * unit.nanometer
     """
     The minimum distance from system solutes from which an alchemical
-    water can be chosen for the charge correction. Default 0.8 nm.
+    water can be chosen for the charge correction.  Waters closer to
+    any non-solvent atom are excluded.  Default 0.8 nm.
     """
 
 

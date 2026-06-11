@@ -13,7 +13,11 @@ alchemical sampling methods:
 
 Current limitations
 -------------------
-* Alchemical species with a net charge are not currently supported.
+* Charged disappearing ligands are supported only with explicit charge
+  correction enabled (``explicit_charge_correction=True``) and require
+  solvated PME systems with 3-site water models.  Only formal charges
+  of +/-1 are currently supported.  Use ``adaptive_settings()`` to
+  auto-detect charged ligands and enable correction.
 * Disappearing molecules are only allowed in state A.
 * Only small molecules are allowed to act as alchemical molecules.
 
@@ -248,12 +252,27 @@ class AbsoluteBindingProtocol(gufe.Protocol):
         if stateA.contains(ProteinMembraneComponent):
             protocol_settings.complex_integrator_settings.barostat = "MonteCarloMembraneBarostat"
 
+        # Enable explicit charge correction for charged disappearing ligands
+        diff = stateA.component_diff(stateB)
+        if len(diff[0]) == 1 and isinstance(diff[0][0], SmallMoleculeComponent):
+            ligand_charge = diff[0][0].total_charge
+            if ligand_charge != 0:
+                info = (
+                    f"Charged disappearing ligand (charge={ligand_charge}) "
+                    f"detected: '{diff[0][0].name}'. Enabling explicit "
+                    "charge correction."
+                )
+                logger.info(info)
+                protocol_settings.alchemical_settings.explicit_charge_correction = True
+
         return protocol_settings
 
     @staticmethod
     def _validate_endstates(
         stateA: ChemicalSystem,
         stateB: ChemicalSystem,
+        alchemical_settings: AlchemicalSettings | None = None,
+        nonbonded_method: str = "pme",
     ) -> None:
         """
         A binding transformation is defined (in terms of gufe components)
@@ -266,6 +285,13 @@ class AbsoluteBindingProtocol(gufe.Protocol):
           The chemical system of end state A
         stateB : ChemicalSystem
           The chemical system of end state B
+        alchemical_settings : AlchemicalSettings or None
+          Alchemical settings; when provided, charged ligands are
+          accepted if ``explicit_charge_correction`` is enabled and
+          all prerequisites are met.
+        nonbonded_method : str
+          The nonbonded method (e.g. ``"pme"``).  Required for
+          validating charge correction prerequisites.
 
         Raises
         ------
@@ -275,7 +301,8 @@ class AbsoluteBindingProtocol(gufe.Protocol):
           If stateA has more than one unique Component.
           If the stateA unique Component is not a SmallMoleculeComponent.
           If stateB contains any unique Components.
-          If the alchemical species is charged.
+          If the alchemical species is charged and charge correction
+          is not enabled or prerequisites are not met.
         """
         if not (stateA.contains(ProteinComponent) and stateB.contains(ProteinComponent)):
             errmsg = "No ProteinComponent found"
@@ -302,18 +329,66 @@ class AbsoluteBindingProtocol(gufe.Protocol):
             )
             raise ValueError(errmsg)
 
-        # Check that the state A unique isn't charged
-        if diff[0][0].total_charge != 0:
-            errmsg = (
-                "Charged alchemical molecules are not currently "
-                "supported for solvation free energies. "
-                f"Molecule total charge: {diff[0][0].total_charge}."
+        ligand_charge = diff[0][0].total_charge
+        if ligand_charge != 0:
+            AbsoluteBindingProtocol._validate_charge_correction(
+                ligand_charge=ligand_charge,
+                alchemical_settings=alchemical_settings,
+                nonbonded_method=nonbonded_method,
             )
-            raise ValueError(errmsg)
 
         # If there are any alchemical Components in state B
         if len(diff[1]) > 0:
             errmsg = "Components appearing in state B are not currently supported"
+            raise ValueError(errmsg)
+
+    @staticmethod
+    def _validate_charge_correction(
+        ligand_charge: int,
+        alchemical_settings: AlchemicalSettings | None,
+        nonbonded_method: str,
+    ) -> None:
+        """
+        Validate that charge correction prerequisites are met for a
+        charged disappearing ligand.
+
+        Parameters
+        ----------
+        ligand_charge : int
+            Formal charge of the disappearing ligand.
+        alchemical_settings : AlchemicalSettings or None
+            Current alchemical settings.
+        nonbonded_method : str
+            The nonbonded method being used.
+
+        Raises
+        ------
+        ValueError
+            If charge correction is not enabled, if the nonbonded
+            method is not PME, or if the absolute charge exceeds 1.
+        """
+        if alchemical_settings is None or not alchemical_settings.explicit_charge_correction:
+            errmsg = (
+                f"Disappearing ligand has formal charge {ligand_charge}. "
+                "Charged alchemical molecules require "
+                "'explicit_charge_correction = True' in alchemical settings. "
+                "Use adaptive_settings() or enable it manually."
+            )
+            raise ValueError(errmsg)
+
+        if nonbonded_method.lower() != "pme":
+            errmsg = (
+                "Explicit charge correction requires PME electrostatics. "
+                f"Got nonbonded_method='{nonbonded_method}'."
+            )
+            raise ValueError(errmsg)
+
+        if abs(ligand_charge) > 1:
+            errmsg = (
+                f"Disappearing ligand has formal charge {ligand_charge}. "
+                "Only absolute charges of 1 are currently supported "
+                "with explicit charge correction."
+            )
             raise ValueError(errmsg)
 
     @staticmethod
@@ -401,7 +476,12 @@ class AbsoluteBindingProtocol(gufe.Protocol):
         # Validate the end states & alchemical components
         system_validation.validate_chemical_system(stateA)
         system_validation.validate_chemical_system(stateB)
-        self._validate_endstates(stateA, stateB)
+        self._validate_endstates(
+            stateA,
+            stateB,
+            alchemical_settings=self.settings.alchemical_settings,
+            nonbonded_method=self.settings.forcefield_settings.nonbonded_method,
+        )
 
         # Validate the complex lambda schedule
         self._validate_lambda_schedule(
