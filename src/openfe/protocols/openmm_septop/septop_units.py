@@ -779,7 +779,32 @@ class SepTopComplexSetupUnit(SepTopComplexMixin, BaseSepTopSetupUnit):
             atom_indices_B[0] : atom_indices_B[-1] + 1
         ]
 
-        # 9. Create the alchemical system
+        # 9. Handle charge correction if needed
+        charge_difference = self._get_charge_difference(alchem_comps)
+        if (
+            charge_difference != 0
+            and settings["alchemical_settings"].explicit_charge_correction
+        ):
+            self.logger.info(
+                f"Applying explicit charge correction (charge_diff={charge_difference})"
+            )
+            # Get the SolventComponent for ion names (solv_comp may be a
+            # SolvatedPDBComponent in the complex leg)
+            stateA = self._inputs["stateA"]
+            solvent_comps = stateA.get_components_of_type(SolventComponent)
+            charge_solv_comp = solvent_comps[0] if solvent_comps else solv_comp
+
+            atom_indices_AB_B = self._handle_charge_correction(
+                topology=omm_topology_AB,
+                system=omm_system_AB,
+                positions=positions_AB,
+                alchem_indices_B=atom_indices_AB_B,
+                charge_difference=charge_difference,
+                alchemical_settings=settings["alchemical_settings"],
+                solvent_component=charge_solv_comp,
+            )
+
+        # 10. Create the alchemical system
         self.logger.info("Creating the alchemical system and applying restraints")
 
         alchemical_factory, alchemical_system = self._get_alchemical_system(
@@ -789,7 +814,7 @@ class SepTopComplexSetupUnit(SepTopComplexMixin, BaseSepTopSetupUnit):
             settings["alchemical_settings"],
         )
 
-        # 10. Apply Restraints
+        # 11. Apply Restraints
         corr_A, corr_B, system, restraint_geom_A, restraint_geom_B = self._add_restraints(
             alchemical_system,
             omm_topology_A,
@@ -1077,7 +1102,26 @@ class SepTopSolventSetupUnit(SepTopSolventMixin, BaseSepTopSetupUnit):
         atom_indices_AB_A = comp_atomids_AB[alchem_comps["stateA"][0]]
         atom_indices_AB_B = comp_atomids_AB[smc_B]
 
-        # 7. Create the alchemical system
+        # 7. Handle charge correction if needed
+        charge_difference = self._get_charge_difference(alchem_comps)
+        if (
+            charge_difference != 0
+            and settings["alchemical_settings"].explicit_charge_correction
+        ):
+            self.logger.info(
+                f"Applying explicit charge correction (charge_diff={charge_difference})"
+            )
+            atom_indices_AB_B = self._handle_charge_correction(
+                topology=omm_topology_AB,
+                system=omm_system_AB,
+                positions=positions_AB,
+                alchem_indices_B=atom_indices_AB_B,
+                charge_difference=charge_difference,
+                alchemical_settings=settings["alchemical_settings"],
+                solvent_component=solv_comp,
+            )
+
+        # 8. Create the alchemical system
         self.logger.info("Creating the alchemical system and applying restraints")
 
         alchemical_factory, alchemical_system = self._get_alchemical_system(
@@ -1087,7 +1131,7 @@ class SepTopSolventSetupUnit(SepTopSolventMixin, BaseSepTopSetupUnit):
             settings["alchemical_settings"],
         )
 
-        # 8. Apply Restraints
+        # 9. Apply Restraints
         rdmol_A = alchem_comps["stateA"][0].to_rdkit()
         rdmol_B = smc_B.to_rdkit()
         Chem.SanitizeMol(rdmol_A)

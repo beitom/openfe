@@ -22,6 +22,8 @@ from gufe.settings import (
     SettingsBaseModel,
     ThermoSettings,
 )
+from gufe.settings.typing import NanometerQuantity
+from openff.units import unit
 from pydantic import field_validator
 
 from openfe.protocols.openmm_utils.omm_settings import (
@@ -84,6 +86,24 @@ class AlchemicalSettings(SettingsBaseModel):
     """
     Scaling constant ``c`` in
     Eq. 13 from Pham and Shirts, J. Chem. Phys. 135, 034114 (2011).
+    """
+    explicit_charge_correction: bool = False
+    """
+    Whether to explicitly account for a net charge difference during
+    the alchemical transformation by transforming a bulk water molecule
+    into a counterion. The ion is coupled/decoupled alongside the
+    ligand whose appearance would otherwise change the system's total
+    charge.
+
+    Only absolute charge differences of 1 are currently supported.
+    Requires solvent (explicit water) and PME electrostatics.
+
+    Default False.
+    """
+    explicit_charge_correction_cutoff: NanometerQuantity = 0.8 * unit.nanometer
+    """
+    The minimum distance from system solutes from which an alchemical
+    water can be chosen for the charge correction. Default 0.8 nm.
     """
 
 

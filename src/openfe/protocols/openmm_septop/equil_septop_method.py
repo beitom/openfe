@@ -14,8 +14,10 @@ following alchemical sampling methods:
 Current limitations
 -------------------
 
-* Transformations that involve net charge changes are currently not supported.
-  The ligands must have the same net charge.
+* Charge-changing transformations (|formal_charge_A - formal_charge_B| = 1) are
+  supported when ``explicit_charge_correction`` is enabled in alchemical_settings.
+  This is automatically enabled by ``_adaptive_settings``. Larger charge differences
+  (|diff| > 1) are not supported. The correction requires solvent and PME.
 * Only small molecules are allowed to act as alchemical molecules.
   Alchemically changing protein or solvent components would induce
   perturbations which are too large to be handled by this Protocol.
@@ -107,23 +109,104 @@ due.cite(
 logger = logging.getLogger(__name__)
 
 
+def _validate_charge_difference(
+    ligandA: SmallMoleculeComponent,
+    ligandB: SmallMoleculeComponent,
+    explicit_charge_correction: bool,
+    nonbonded_method: str,
+    has_solvent: bool,
+) -> int:
+    """
+    Validate the net charge difference between the two ligand end states.
+
+    Parameters
+    ----------
+    ligandA : SmallMoleculeComponent
+        The ligand in state A.
+    ligandB : SmallMoleculeComponent
+        The ligand in state B.
+    explicit_charge_correction : bool
+        Whether explicit charge correction is enabled.
+    nonbonded_method : str
+        The nonbonded method (e.g. 'pme').
+    has_solvent : bool
+        Whether the system contains a SolventComponent.
+
+    Returns
+    -------
+    int
+        The charge difference (formal_charge_A - formal_charge_B).
+
+    Raises
+    ------
+    ValueError
+        If a charge difference exists and explicit correction is not enabled.
+        If explicit correction is requested without solvent.
+        If explicit correction is requested without PME.
+        If the absolute charge difference exceeds 1.
+    """
+    chg_A = Chem.rdmolops.GetFormalCharge(ligandA.to_rdkit())
+    chg_B = Chem.rdmolops.GetFormalCharge(ligandB.to_rdkit())
+    difference = chg_A - chg_B
+
+    if difference == 0:
+        return 0
+
+    if not explicit_charge_correction:
+        errmsg = (
+            f"A charge difference of {difference} is observed "
+            "between the end states. Either enable "
+            "explicit_charge_correction in alchemical_settings or "
+            "use _adaptive_settings which enables it automatically."
+        )
+        raise ValueError(errmsg)
+
+    if not has_solvent:
+        errmsg = "Cannot use explicit charge correction without solvent"
+        raise ValueError(errmsg)
+
+    if nonbonded_method.lower() != "pme":
+        errmsg = (
+            "Explicit charge correction when not using PME is not "
+            "currently supported."
+        )
+        raise ValueError(errmsg)
+
+    if abs(difference) > 1:
+        errmsg = (
+            f"A charge difference of {difference} is observed "
+            "between the end states and an explicit charge "
+            "correction has been requested. Only absolute "
+            "differences of 1 are currently supported."
+        )
+        raise ValueError(errmsg)
+
+    ion = {-1: "positive", 1: "negative"}[difference]
+    logger.info(
+        f"A charge difference of {difference} is observed between the "
+        f"end states. This will be addressed by coupling a {ion} "
+        "counterion alongside ligand B."
+    )
+
+    return difference
+
+
 def _check_alchemical_charge_difference(
     ligandA: SmallMoleculeComponent,
     ligandB: SmallMoleculeComponent,
 ):
     """
-    Checks and returns the difference in formal charge between state A
-    and B.
+    Legacy validation that rejects all charge-changing transformations.
+
+    .. deprecated::
+        Use ``_validate_charge_difference`` with explicit_charge_correction
+        support instead. This function is retained for backwards compatibility
+        in tests but is no longer called by the protocol itself.
 
     Raises
     ------
     ValueError
-      * If a change in net charge is detected.
-
-    Parameters
-    ----------
-    ligandA: SmallMoleculeComponent
-    ligandB: SmallMoleculeComponent
+      If a change in net charge is detected.
     """
     chg_A = Chem.rdmolops.GetFormalCharge(ligandA.to_rdkit())
     chg_B = Chem.rdmolops.GetFormalCharge(ligandB.to_rdkit())
@@ -296,12 +379,33 @@ class SepTopProtocol(gufe.Protocol):
         -------
         SepTopSettings
             The recommended settings for this protocol based on the input states.
+
+        Notes
+        -----
+        If the transformation involves a net charge change, the settings are
+        adapted to enable explicit charge correction automatically.
         """
         # use initial settings or default settings
         if initial_settings is not None:
             protocol_settings = initial_settings.model_copy(deep=True)
         else:
             protocol_settings = cls.default_settings()
+
+        # Check for charge-changing transformation
+        diff = stateA.component_diff(stateB)
+        if len(diff[0]) == 1 and len(diff[1]) == 1:
+            if isinstance(diff[0][0], SmallMoleculeComponent) and isinstance(
+                diff[1][0], SmallMoleculeComponent
+            ):
+                chg_A = Chem.rdmolops.GetFormalCharge(diff[0][0].to_rdkit())
+                chg_B = Chem.rdmolops.GetFormalCharge(diff[1][0].to_rdkit())
+                if chg_A != chg_B:
+                    logger.info(
+                        "Charge changing transformation detected between "
+                        f"{diff[0][0].name} and {diff[1][0].name}. "
+                        "Enabling explicit charge correction."
+                    )
+                    protocol_settings.alchemical_settings.explicit_charge_correction = True
 
         # adapt the barostat based on the ProteinComponent
         if stateA.contains(ProteinMembraneComponent):
@@ -334,7 +438,11 @@ class SepTopProtocol(gufe.Protocol):
           If there are no or more than one alchemical components in state A.
           If there are no or more than one alchemical components in state B.
           If there are any alchemical components that are not SmallMoleculeComponents.
-          If a change in net charge between the alchemical components is detected.
+
+        Notes
+        -----
+        Net charge validation is handled separately in ``_validate()`` where
+        the alchemical settings (explicit_charge_correction) are available.
         """
         # check that there is a protein component
         if not stateA.contains(ProteinComponent):
@@ -378,8 +486,8 @@ class SepTopProtocol(gufe.Protocol):
                 )
                 raise ValueError(errmsg)
 
-        # Raise an error if there is a change in net charge
-        _check_alchemical_charge_difference(diff[0][0], diff[1][0])
+        # Net charge validation is now handled in _validate() where
+        # we have access to alchemical_settings and forcefield_settings
 
     @staticmethod
     def _validate_lambda_schedule(
@@ -497,6 +605,16 @@ class SepTopProtocol(gufe.Protocol):
         nonbonded_method = self.settings.forcefield_settings.nonbonded_method
         # Validate solvent component
         system_validation.validate_solvent(stateA, nonbonded_method)
+
+        # Validate net charge difference
+        diff = stateA.component_diff(stateB)
+        _validate_charge_difference(
+            ligandA=diff[0][0],
+            ligandB=diff[1][0],
+            explicit_charge_correction=self.settings.alchemical_settings.explicit_charge_correction,
+            nonbonded_method=nonbonded_method,
+            has_solvent=stateA.contains(SolventComponent),
+        )
 
         # Validate solvation settings
         settings_validation.validate_openmm_solvation_settings(

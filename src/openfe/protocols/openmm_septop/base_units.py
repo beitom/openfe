@@ -69,6 +69,11 @@ from ..openmm_utils import (
     system_creation,
     system_validation,
 )
+from ..openmm_utils.charge_correction import (
+    get_alchemical_waters,
+    get_water_atom_indices,
+    transform_waters_to_ions_inplace,
+)
 from ..openmm_utils.mdtraj_utils import mdtraj_from_openmm
 from .utils import SepTopParameterState
 
@@ -395,6 +400,97 @@ class BaseSepTopSetupUnit(gufe.ProtocolUnit, SepTopUnitMixin):
         )
 
         return alchemical_factory, alchemical_system
+
+    @staticmethod
+    def _get_charge_difference(
+        alchem_comps: dict[str, list],
+    ) -> int:
+        """
+        Get the formal charge difference between alchemical ligands A and B.
+
+        Returns formal_charge(A) - formal_charge(B).
+        """
+        from rdkit import Chem
+
+        ligA = alchem_comps["stateA"][0]
+        ligB = alchem_comps["stateB"][0]
+        chg_A = Chem.rdmolops.GetFormalCharge(ligA.to_rdkit())
+        chg_B = Chem.rdmolops.GetFormalCharge(ligB.to_rdkit())
+        return chg_A - chg_B
+
+    @staticmethod
+    def _handle_charge_correction(
+        topology: openmm.app.Topology,
+        system: openmm.System,
+        positions: omm_unit.Quantity,
+        alchem_indices_B: list[int],
+        charge_difference: int,
+        alchemical_settings: AlchemicalSettings,
+        solvent_component: SolventComponent,
+    ) -> list[int]:
+        """
+        Apply explicit charge correction by transforming a water into a
+        counterion and adding the water atoms to the alchemical region B.
+
+        The counterion is coupled/decoupled alongside ligand B so that the
+        system maintains a constant total charge at every lambda window.
+
+        Sign convention:
+        - charge_difference = formal_charge(A) - formal_charge(B)
+        - charge_difference > 0: B is more negative → negative ion (Cl-)
+          is coupled alongside B
+        - charge_difference < 0: B is more positive → positive ion (Na+)
+          is coupled alongside B
+
+        Parameters
+        ----------
+        topology : openmm.app.Topology
+            The AB system topology.
+        system : openmm.System
+            The AB system (will be modified in-place).
+        positions : openmm.unit.Quantity
+            Positions of the AB system (nm).
+        alchem_indices_B : list[int]
+            Atom indices of ligand B in the AB system.
+        charge_difference : int
+            formal_charge(stateA) - formal_charge(stateB).
+        alchemical_settings : AlchemicalSettings
+            Settings with charge correction cutoff.
+        solvent_component : SolventComponent
+            The solvent component providing ion names.
+
+        Returns
+        -------
+        updated_alchem_indices_B : list[int]
+            The alchemical indices for region B, now including the
+            water/ion atoms.
+        """
+        if charge_difference == 0:
+            return alchem_indices_B
+
+        import numpy as np
+
+        pos_array = np.array(positions.value_in_unit(omm_unit.nanometer))
+
+        water_resids = get_alchemical_waters(
+            topology=topology,
+            positions=pos_array,
+            charge_difference=charge_difference,
+            distance_cutoff=alchemical_settings.explicit_charge_correction_cutoff,
+        )
+
+        transform_waters_to_ions_inplace(
+            topology=topology,
+            system=system,
+            water_resids=water_resids,
+            charge_difference=charge_difference,
+            solvent_component=solvent_component,
+        )
+
+        water_atom_indices = get_water_atom_indices(topology, water_resids)
+
+        updated_alchem_indices_B = list(alchem_indices_B) + water_atom_indices
+        return updated_alchem_indices_B
 
     @abc.abstractmethod
     def _get_components(
