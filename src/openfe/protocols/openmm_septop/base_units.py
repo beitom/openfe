@@ -15,8 +15,10 @@ TODO
 """
 
 import abc
+import json
 import logging
 import pathlib
+from datetime import UTC, datetime
 from typing import Any, Literal, Optional
 
 import gufe
@@ -78,6 +80,54 @@ from ..openmm_utils.mdtraj_utils import mdtraj_from_openmm
 from .utils import SepTopParameterState
 
 logger = logging.getLogger(__name__)
+
+
+def _heartbeat_time() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, pathlib.Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
+def _file_snapshot(path: pathlib.Path) -> dict[str, Any] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {
+        "path": str(path),
+        "size_bytes": stat.st_size,
+        "mtime": datetime.fromtimestamp(stat.st_mtime, UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+
+
+def _write_xg_heartbeat(shared_basepath: pathlib.Path, **data: Any) -> None:
+    """Write a lightweight SepTop heartbeat for external job monitors.
+
+    This intentionally avoids importing xg into vendored OpenFE. The quickrun
+    wrapper watches these files and forwards changed records into xg metrics and
+    events.
+    """
+    try:
+        record = {"time": _heartbeat_time(), **{k: _jsonable(v) for k, v in data.items()}}
+        latest = shared_basepath / "openfe_xg_heartbeat_latest.json"
+        history = shared_basepath / "openfe_xg_heartbeat.jsonl"
+        latest.write_text(json.dumps(record, sort_keys=True) + "\n")
+        with history.open("a") as fh:
+            fh.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
 
 
 def _pre_equilibrate(
@@ -1301,6 +1351,40 @@ class BaseSepTopRunUnit(gufe.ProtocolUnit, SepTopUnitMixin):
             timestep=settings["integrator_settings"].timestep,
             mc_steps=mc_steps,
         )
+        equil_iterations = int(equil_steps / mc_steps)
+        production_iterations = int(prod_steps / mc_steps)
+
+        output_path = self.shared_basepath / settings["output_settings"].output_filename
+        checkpoint_path = (
+            self.shared_basepath / settings["output_settings"].checkpoint_storage_filename
+        )
+
+        def heartbeat(stage: str, **extra: Any) -> None:
+            iteration = int(getattr(sampler, "_iteration", 0))
+            total = int(getattr(sampler, "number_of_iterations", production_iterations))
+            percent_complete = (iteration / total * 100.0) if total else None
+            _write_xg_heartbeat(
+                self.shared_basepath,
+                simtype=getattr(self, "simtype", "unknown"),
+                unit=type(self).__name__,
+                stage=stage,
+                iteration=iteration,
+                total_iterations=total,
+                percent_complete=percent_complete,
+                equilibration_iterations=equil_iterations,
+                production_iterations=production_iterations,
+                output_file=_file_snapshot(output_path),
+                checkpoint_file=_file_snapshot(checkpoint_path),
+                **extra,
+            )
+
+        heartbeat(
+            "simulation_prepared",
+            mc_steps=int(mc_steps),
+            equilibration_steps=int(equil_steps),
+            production_steps=int(prod_steps),
+            dry=dry,
+        )
 
         if not dry:  # pragma: no-cover
             if sampler._iteration == 0:
@@ -1308,26 +1392,54 @@ class BaseSepTopRunUnit(gufe.ProtocolUnit, SepTopUnitMixin):
                 if self.verbose:
                     self.logger.info("minimizing systems")
 
+                heartbeat("minimization_started")
                 sampler.minimize(max_iterations=settings["simulation_settings"].minimization_steps)
+                heartbeat("minimization_completed")
 
                 # equilibrate
                 if self.verbose:
                     self.logger.info("equilibrating systems")
 
-                sampler.equilibrate(int(equil_steps / mc_steps))
+                heartbeat("equilibration_started", target_iterations=equil_iterations)
+                sampler.equilibrate(equil_iterations)
+                heartbeat("equilibration_completed", target_iterations=equil_iterations)
+            else:
+                heartbeat("resumed", resumed_from_iteration=int(sampler._iteration))
 
             # At this point we are ready for production
             if self.verbose:
                 self.logger.info("running production phase")
 
+            original_update_timing = sampler._update_timing
+
+            def update_timing_with_heartbeat(*args: Any, **kwargs: Any) -> Any:
+                result = original_update_timing(*args, **kwargs)
+                timing = getattr(sampler, "_timing_data", {}) or {}
+                heartbeat(
+                    "production_running",
+                    iteration_seconds=timing.get("iteration_seconds"),
+                    estimated_time_remaining=str(timing.get("estimated_time_remaining")),
+                    estimated_localtime_finish_date=str(
+                        timing.get("estimated_localtime_finish_date")
+                    ),
+                    estimated_total_time=str(timing.get("estimated_total_time")),
+                )
+                return result
+
+            sampler._update_timing = update_timing_with_heartbeat
+
             # We use `run` so that we're limited by the number of iterations
             # we passed when we built the sampler.
-            sampler.run(n_iterations=int(prod_steps / mc_steps) - sampler._iteration)
+            target_iterations = production_iterations - sampler._iteration
+            heartbeat("production_started", target_iterations=target_iterations)
+            sampler.run(n_iterations=target_iterations)
+            heartbeat("production_completed")
 
             if self.verbose:
                 self.logger.info("production phase complete")
 
         else:
+            heartbeat("dry_run_cleanup")
             # close reporter when you're done, prevent file handle clashes
             reporter.close()
 
